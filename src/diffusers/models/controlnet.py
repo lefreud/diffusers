@@ -62,6 +62,61 @@ class ControlNetOutput(BaseOutput):
     mid_block_res_sample: torch.Tensor
 
 
+class LightDirectionEncoder(nn.Module):
+    """
+    Encodes light direction from conditioning features, prior to any denoising.
+    Used to condition the modified timestep embedding.
+    """
+    def __init__(self, input_channels) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([])
+        self.blocks.append(nn.Conv2d(input_channels, 32, kernel_size=3, padding=1))
+        # encoder blocks from 320x64x64 to 2x1x1
+        # 32x64x64
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2))
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+
+        # 32x32x32
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2))
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+
+        # 32x16x16
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2))
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+
+        # 32x8x8
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2))
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+
+        # 32x4x4
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2))
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+
+        # 32x2x2
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2))
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1))
+
+        # 32x1x1
+        self.blocks.append(nn.Conv2d(32, 32, kernel_size=3, padding=1, stride=2))
+        self.blocks.append(nn.Conv2d(32, 2, kernel_size=3, padding=1))
+
+    def forward(self, x):
+        for block in self.blocks[:-1]:
+            x = block(x)
+            x = F.silu(x)
+    
+        x = self.blocks[-1](x)
+
+        # Bx2x1x1
+        x = x.view(x.shape[0], -1)
+        # Bx2
+
+        # convert to unit complex number
+        x = F.normalize(x, dim=1)
+
+        return x
+
+
 class ControlNetConditioningEmbedding(nn.Module):
     """
     Quoting from https://arxiv.org/abs/2302.05543: "Stable Diffusion uses a pre-processing method similar to VQ-GAN
@@ -77,6 +132,7 @@ class ControlNetConditioningEmbedding(nn.Module):
         conditioning_embedding_channels: int,
         conditioning_channels: int = 3,
         block_out_channels: Tuple[int] = (16, 32, 96, 256),
+        use_light_direction_encoder: bool = False,
     ):
         super().__init__()
 
@@ -90,6 +146,9 @@ class ControlNetConditioningEmbedding(nn.Module):
             self.blocks.append(nn.Conv2d(channel_in, channel_in, kernel_size=3, padding=1))
             self.blocks.append(nn.Conv2d(channel_in, channel_out, kernel_size=3, padding=1, stride=2))
 
+        if use_light_direction_encoder:
+            self.light_direction_estimator = LightDirectionEncoder(channel_out)
+
         self.conv_out = zero_module(
             nn.Conv2d(block_out_channels[-1], conditioning_embedding_channels, kernel_size=3, padding=1)
         )
@@ -102,9 +161,10 @@ class ControlNetConditioningEmbedding(nn.Module):
             embedding = block(embedding)
             embedding = F.silu(embedding)
 
+        light_direction = self.light_direction_estimator(embedding) if hasattr(self, "light_direction_estimator") else None
         embedding = self.conv_out(embedding)
-
-        return embedding
+        
+        return embedding, light_direction
 
 
 class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
@@ -214,6 +274,8 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
         global_pool_conditions: bool = False,
         addition_embed_type_num_heads=64,
+        # added for light direction estimation
+        use_light_direction_encoder: bool = False,
     ):
         super().__init__()
 
@@ -337,10 +399,12 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
             raise ValueError(f"addition_embed_type: {addition_embed_type} must be None, 'text' or 'text_image'.")
 
         # control net conditioning embedding
+        self.use_light_direction_encoder = use_light_direction_encoder
         self.controlnet_cond_embedding = ControlNetConditioningEmbedding(
             conditioning_embedding_channels=block_out_channels[0],
             block_out_channels=conditioning_embedding_out_channels,
             conditioning_channels=conditioning_channels,
+            use_light_direction_encoder=use_light_direction_encoder,
         )
 
         self.down_blocks = nn.ModuleList([])
@@ -428,6 +492,8 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
         controlnet_conditioning_channel_order: str = "rgb",
         conditioning_embedding_out_channels: Optional[Tuple[int]] = (16, 32, 96, 256),
         load_weights_from_unet: bool = True,
+        # added for light direction estimation
+        use_light_direction_encoder: bool = False,
     ):
         r"""
         Instantiate a [`ControlNetModel`] from [`UNet2DConditionModel`].
@@ -476,6 +542,8 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
             projection_class_embeddings_input_dim=unet.config.projection_class_embeddings_input_dim,
             controlnet_conditioning_channel_order=controlnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
+            # added for light direction estimation
+            use_light_direction_encoder=use_light_direction_encoder,
         )
 
         if load_weights_from_unet:
@@ -709,7 +777,13 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
             attention_mask = (1 - attention_mask.to(sample.dtype)) * -10000.0
             attention_mask = attention_mask.unsqueeze(1)
 
-        # 1. time
+        # 1. pre-process
+        sample = self.conv_in(sample)
+
+        controlnet_cond, predicted_light_direction = self.controlnet_cond_embedding(controlnet_cond)
+        sample = sample + controlnet_cond
+
+        # 2. time
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
@@ -742,6 +816,16 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
 
             if self.config.class_embed_type == "timestep":
                 class_labels = self.time_proj(class_labels)
+            
+            if self.use_light_direction_encoder:
+                def complex_mul(a, b):
+                    out = torch.zeros_like(a)
+                    out[:, 0] = a[:, 0] * b[:, 0] - a[:, 1] * b[:, 1]
+                    out[:, 1] = a[:, 0] * b[:, 1] + a[:, 1] * b[:, 0]
+                    return out
+                
+                class_labels_complex = complex_mul(class_labels[:, :2], predicted_light_direction)
+                class_labels = torch.cat([class_labels_complex, class_labels[:, 2:]], dim=-1)
 
             class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
             emb = emb + class_emb
@@ -769,12 +853,6 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
                 aug_emb = self.add_embedding(add_embeds)
 
         emb = emb + aug_emb if aug_emb is not None else emb
-
-        # 2. pre-process
-        sample = self.conv_in(sample)
-
-        controlnet_cond = self.controlnet_cond_embedding(controlnet_cond)
-        sample = sample + controlnet_cond
 
         # 3. down
         down_block_res_samples = (sample,)
